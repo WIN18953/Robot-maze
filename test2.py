@@ -1,0 +1,346 @@
+from collections import deque
+import time
+from robomaster import robot
+
+# =============================================================================
+# 1. การตั้งค่าระบบ Grid 4x4 (0,0 ถึง 3,3)
+# =============================================================================
+GRID_SIZE = 0.60  # ระยะทาง 1 ช่อง = 60 cm
+GOAL_POS = (3, 3) # พิกัดเป้าหมายสูงสุด
+
+BASE_SPEED = 0.16 # ความเร็วเดินหน้า (m/s)
+TURN_SPEED = 45   # ความเร็วหมุนตัว (deg/s)
+
+# พารามิเตอร์ PID
+KP_YAW = 1.4      # สัมประสิทธิ์คุมมุมองศาหัวรถให้ตรงเป๊ะ
+KD_YAW = 0.08     # แดมป์การส่ายของหัวรถ
+KP_WALL = 0.0007  # สัมประสิทธิ์สไลด์รักษากึ่งกลางเลน
+MAX_CORRECTION_Y = 0.10
+
+DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # 0:N, 1:E, 2:S, 3:W
+DIR_NAMES = ["NORTH (^)", "EAST (>)", "SOUTH (v)", "WEST (<)"]
+DIR_ICONS = ["^", ">", "v", "<"]
+YAW_TARGETS = [0.0, 90.0, 180.0, -90.0]
+
+maze_map = {}
+step_history = {(0, 0): 0}
+step_counter = 0
+current_pos = (0, 0)
+current_dir_idx = 0
+
+# =============================================================================
+# 2. ฟังก์ชันวาดแผนที่ Fixed 4x4 Grid
+# =============================================================================
+def print_fixed_map():
+    global current_pos, current_dir_idx, GOAL_POS, step_history, maze_map
+    print("\n" + "=" * 48)
+    print(f"      4x4 MAZE NAVIGATOR  |  TARGET: {GOAL_POS}  ")
+    print("=" * 48)
+
+    for y in range(3, -1, -1):
+        top_str = ""
+        for x in range(4):
+            cell = (x, y)
+            if cell in maze_map and maze_map[cell].get(0) == "WALL":
+                top_str += "+---"
+            else:
+                top_str += "+   " if cell in maze_map else "+..."
+        print(top_str + "+")
+
+        mid_str = ""
+        for x in range(4):
+            cell = (x, y)
+            wall_w = "|" if (cell in maze_map and maze_map[cell].get(3) == "WALL") else (" " if cell in maze_map else ".")
+            
+            if cell == current_pos:
+                content = f"[{DIR_ICONS[current_dir_idx]}]"
+            elif cell == GOAL_POS:
+                content = " *G*"
+            elif cell in step_history:
+                content = f" {step_history[cell]:>2}"
+            elif cell in maze_map:
+                content = " . "
+            else:
+                content = " ? "
+            mid_str += wall_w + content
+        
+        last_cell = (3, y)
+        wall_e = "|" if (last_cell in maze_map and maze_map[last_cell].get(1) == "WALL") else "."
+        print(mid_str + wall_e + f"  (Y={y})")
+
+    bot_str = ""
+    for x in range(4):
+        cell = (x, 0)
+        bot_str += "+---" if (cell in maze_map and maze_map[cell].get(2) == "WALL") else "+..."
+    print(bot_str + "+")
+    print("  X=0  X=1  X=2  X=3")
+    print(f"\n📍 Position: {current_pos} | Heading: {DIR_NAMES[current_dir_idx]}")
+    print("=" * 48 + "\n")
+
+# =============================================================================
+# 3. BFS Pathfinding
+# =============================================================================
+def bfs_path_to_goal(start, target):
+    queue = deque([[start]])
+    visited = {start}
+
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+
+        if node == target:
+            return path
+
+        if node not in maze_map:
+            return path
+
+        for d_idx, (dx, dy) in enumerate(DIRS):
+            neighbor = (node[0] + dx, node[1] + dy)
+            if 0 <= neighbor[0] < 4 and 0 <= neighbor[1] < 4:
+                if maze_map[node].get(d_idx) == "OPEN" and neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(path + [neighbor])
+    return None
+
+# =============================================================================
+# 4. ฟังก์ชันหลัก
+# =============================================================================
+def main():
+    global current_pos, current_dir_idx, step_counter
+
+    ep_robot = robot.Robot()
+    print("Connecting via AP Mode...")
+    ep_robot.initialize(conn_type="ap")
+
+    chassis = ep_robot.chassis
+    sensor = ep_robot.sensor
+    sensor_adaptor = ep_robot.sensor_adaptor
+    sensor_adaptor.start()
+
+    tof_front = 9999
+    current_yaw = 0.0
+
+    def on_tof_data(sub_info):
+        nonlocal tof_front
+        if isinstance(sub_info, (list, tuple)) and len(sub_info) > 0:
+            tof_front = sub_info[0]
+        elif isinstance(sub_info, (int, float)):
+            tof_front = sub_info
+
+    def on_attitude_data(sub_info):
+        nonlocal current_yaw
+        yaw, pitch, roll = sub_info
+        current_yaw = yaw
+
+    sensor.sub_distance(freq=20, callback=on_tof_data)
+    chassis.sub_attitude(freq=20, callback=on_attitude_data)
+
+    # -------------------------------------------------------------------------
+    # Calibrate เก็บค่ากึ่งกลางช่อง 3 วินาทีแรก
+    # -------------------------------------------------------------------------
+    print("=" * 70)
+    print(" 3 วินาทีแรก: วางหุ่นตรงกึ่งกลางช่อง (0,0) เพื่อจำ Reference ซ้าย-ขวา ")
+    print("=" * 70)
+
+    samples_r = []
+    samples_l = []
+    start_time = time.time()
+
+    while time.time() - start_time < 3.0:
+        val_r = sensor_adaptor.get_adc(id=1, port=1) or 0
+        val_l = sensor_adaptor.get_adc(id=2, port=1) or 0
+        if val_r > 0: samples_r.append(val_r)
+        if val_l > 0: samples_l.append(val_l)
+        
+        rem_time = 3.0 - (time.time() - start_time)
+        print(f"\r[CALIBRATING: {rem_time:.1f}s] Sharp-L: {val_l:4d} | Sharp-R: {val_r:4d} | ToF: {tof_front:4d}mm", end="")
+        time.sleep(0.05)
+
+    ref_sharp_r = sum(samples_r) / len(samples_r) if samples_r else 550
+    ref_sharp_l = sum(samples_l) / len(samples_l) if samples_l else 550
+    initial_yaw_offset = current_yaw
+
+    threshold_r = ref_sharp_r - 90
+    threshold_l = ref_sharp_l - 90
+
+    print(f"\n\n>>> Target R={ref_sharp_r:.0f} | Target L={ref_sharp_l:.0f} | Yaw-Offset={initial_yaw_offset:.1f}° <<<")
+
+    def normalize_angle(angle):
+        while angle > 180.0: angle -= 360.0
+        while angle <= -180.0: angle += 360.0
+        return angle
+
+    def rotate_to_dir(target_dir):
+        """หมุนตัวแบบนุ่มนวลและตรงมุมเป้าหมาย"""
+        global current_dir_idx
+        turn_steps = (target_dir - current_dir_idx) % 4
+        if turn_steps == 0:
+            return
+
+        chassis.drive_wheels(w1=0, w2=0, w3=0, w4=0)
+        time.sleep(0.1)
+
+        if turn_steps == 1:
+            chassis.move(x=0, y=0, z=-90, z_speed=TURN_SPEED).wait_for_completed()
+        elif turn_steps == 2:
+            chassis.move(x=0, y=0, z=180, z_speed=TURN_SPEED).wait_for_completed()
+        elif turn_steps == 3:
+            chassis.move(x=0, y=0, z=90, z_speed=TURN_SPEED).wait_for_completed()
+        current_dir_idx = target_dir
+        time.sleep(0.2)
+
+    def drive_one_grid_pid():
+        """เดินหน้า 60 cm พร้อมระบบ PID Yaw Lock + Wall Centering"""
+        duration = GRID_SIZE / BASE_SPEED
+        t_start = time.time()
+        last_yaw_error = 0.0
+
+        target_yaw = initial_yaw_offset + YAW_TARGETS[current_dir_idx]
+
+        while time.time() - t_start < duration:
+            # 1. ตรวจสอบระยะ ToF หน้า (ถึงกึ่งกลางช่อง 220 mm ตัดหยุดทันที)
+            if 0 < tof_front <= 220:
+                break
+
+            # 2. อ่านค่าเซนเซอร์
+            sharp_r = sensor_adaptor.get_adc(id=4, port=1) or 0
+            sharp_l = sensor_adaptor.get_adc(id=3, port=1) or 0
+            ir_r = sensor_adaptor.get_io(id=2, port=1)
+            ir_l = sensor_adaptor.get_io(id=1, port=1)
+
+            # 3. PID Yaw Controller (ล็อกทิศหัวรถให้ตรงเป๊ะ)
+            yaw_error = normalize_angle(target_yaw - current_yaw)
+            d_yaw = yaw_error - last_yaw_error
+            z_speed = (KP_YAW * yaw_error) + (KD_YAW * d_yaw)
+            last_yaw_error = yaw_error
+
+            # 4. IR Safety Shield
+            if ir_r == 0:
+                y_speed = -0.12
+            elif ir_l == 0:
+                y_speed = 0.12
+            else:
+                # 5. Wall Centering Controller
+                has_wall_r = (sharp_r >= threshold_r)
+                has_wall_l = (sharp_l >= threshold_l)
+
+                if has_wall_r and has_wall_l:
+                    # มีกำแพง 2 ฝั่ง: คุมให้วิ่งผ่ากึ่งกลาง
+                    diff = (sharp_l - ref_sharp_l) - (sharp_r - ref_sharp_r)
+                    y_speed = KP_WALL * diff
+                elif has_wall_r:
+                    # มีกำแพงขวาฝั่งเดียว
+                    err_r = ref_sharp_r - sharp_r
+                    y_speed = KP_WALL * err_r
+                elif has_wall_l:
+                    # มีกำแพงซ้ายฝั่งเดียว
+                    err_l = ref_sharp_l - sharp_l
+                    y_speed = -KP_WALL * err_l
+                else:
+                    # ทางเปิดโล่ง 2 ฝั่ง: วิ่งตรงตามแนว Yaw
+                    y_speed = 0.0
+
+                y_speed = max(min(y_speed, MAX_CORRECTION_Y), -MAX_CORRECTION_Y)
+
+            chassis.drive_speed(x=BASE_SPEED, y=y_speed, z=z_speed)
+            time.sleep(0.02)
+
+        # จบช่วงเดิน: เบรกนิ่งสนิท
+        chassis.drive_wheels(w1=0, w2=0, w3=0, w4=0)
+        time.sleep(0.25)
+
+    # =========================================================================
+    # Main Navigation Loop
+    # =========================================================================
+    try:
+        while True:
+            # 1. ตรวจสอบเป้าหมาย
+            if current_pos == GOAL_POS:
+                rotate_to_dir(0)
+                print(f"\n🎉 บรรลุเป้าหมายพิกัด {GOAL_POS} เรียบร้อยแล้ว!")
+                print_fixed_map()
+                break
+
+            # 2. หยุดนิ่งสแกนกำแพงในช่องปัจจุบัน
+            time.sleep(0.25)
+            front_wall = (0 < tof_front < 500)
+            sharp_r = sensor_adaptor.get_adc(id=1, port=1) or 0
+            sharp_l = sensor_adaptor.get_adc(id=2, port=1) or 0
+            
+            right_wall = (sharp_r >= threshold_r)
+            left_wall  = (sharp_l >= threshold_l)
+
+            if current_pos not in maze_map:
+                maze_map[current_pos] = {}
+
+            f_dir = current_dir_idx
+            r_dir = (current_dir_idx + 1) % 4
+            l_dir = (current_dir_idx + 3) % 4
+            b_dir = (current_dir_idx + 2) % 4
+
+            maze_map[current_pos][f_dir] = "WALL" if front_wall else "OPEN"
+            maze_map[current_pos][r_dir] = "WALL" if right_wall else "OPEN"
+            maze_map[current_pos][l_dir] = "WALL" if left_wall else "OPEN"
+            
+            if b_dir not in maze_map[current_pos]:
+                maze_map[current_pos][b_dir] = "OPEN"
+
+            # ขอบนอก 4x4
+            x, y = current_pos
+            if y == 3: maze_map[current_pos][0] = "WALL"
+            if x == 3: maze_map[current_pos][1] = "WALL"
+            if y == 0: maze_map[current_pos][2] = "WALL"
+            if x == 0: maze_map[current_pos][3] = "WALL"
+
+            print(f"Debug: Front={tof_front}mm | R={sharp_r} (Th:{threshold_r:.0f}) | L={sharp_l} (Th:{threshold_l:.0f})")
+            print_fixed_map()
+
+            # 3. คำนวณเส้นทาง BFS
+            path = bfs_path_to_goal(current_pos, GOAL_POS)
+            if not path or len(path) < 2:
+                print("❌ สำรวจจนหมดแล้ว ไม่มีเส้นทางไปถึงเป้าหมายได้")
+                break
+
+            # 4. แปลงพิกัดและหมุนตัว
+            next_node = path[1]
+            dx = next_node[0] - current_pos[0]
+            dy = next_node[1] - current_pos[1]
+            target_dir = DIRS.index((dx, dy))
+
+            rotate_to_dir(target_dir)
+
+            # 5. Re-verify ด้วย ToF หน้าซ้ำ
+            time.sleep(0.2)
+            if 0 < tof_front <= 220:
+                print("⚠️ ToF ตรวจพบกำแพงหน้า บันทึก WALL และคำนวณใหม่...")
+                maze_map[current_pos][target_dir] = "WALL"
+                continue
+
+            # 6. เดินหน้าด้วยระบบ PID
+            drive_one_grid_pid()
+
+            # เชื่อมต่อทางย้อนกลับ
+            back_dir = (target_dir + 2) % 4
+            if next_node not in maze_map:
+                maze_map[next_node] = {}
+            maze_map[next_node][back_dir] = "OPEN"
+
+            current_pos = next_node
+            if current_pos not in step_history:
+                step_counter += 1
+                step_history[current_pos] = step_counter
+
+    except KeyboardInterrupt:
+        print("\nหยุดการทำงานโดยผู้ใช้")
+
+    finally:
+        chassis.drive_wheels(w1=0, w2=0, w3=0, w4=0)
+        sensor.unsub_distance()
+        chassis.unsub_attitude()
+        sensor_adaptor.stop()
+        ep_robot.close()
+        print("ปิดระบบเรียบร้อย")
+
+if __name__ == '__main__':
+    main()
+    
