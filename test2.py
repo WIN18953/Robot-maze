@@ -6,13 +6,13 @@ from robomaster import robot
 # 1. การตั้งค่าระบบ Grid 4x4 (0,0 ถึง 3,3)
 # =============================================================================
 GRID_SIZE = 0.60  # ระยะทาง 1 ช่อง = 60 cm
-GOAL_POS = (3, 3) # พิกัดเป้าหมายสูงสุด
+GOAL_POS = (1, 2) # พิกัดเป้าหมายสูงสุด
 
 BASE_SPEED = 0.16 # ความเร็วเดินหน้า (m/s)
 TURN_SPEED = 45   # ความเร็วหมุนตัว (deg/s)
 
 # พารามิเตอร์ PID
-KP_YAW = 1.4      # สัมประสิทธิ์คุมมุมองศาหัวรถให้ตรงเป๊ะ
+KP_YAW = 1.4      # สัมประสิทธิ์คุมมุมองศาหัวรถให้ตรง
 KD_YAW = 0.08     # แดมป์การส่ายของหัวรถ
 KP_WALL = 0.0007  # สัมประสิทธิ์สไลด์รักษากึ่งกลางเลน
 MAX_CORRECTION_Y = 0.10
@@ -78,7 +78,7 @@ def print_fixed_map():
     print("=" * 48 + "\n")
 
 # =============================================================================
-# 3. BFS Pathfinding
+# 3. BFS Pathfinding (ปรับแก้ไขให้รองรับ Backtracking ไปช่อง Unexplored ?)
 # =============================================================================
 def bfs_path_to_goal(start, target):
     queue = deque([[start]])
@@ -88,22 +88,33 @@ def bfs_path_to_goal(start, target):
         path = queue.popleft()
         node = path[-1]
 
-        if node == target:
-            return path
-
-        if node not in maze_map:
+        # เจอเป้าหมาย หรือเจอช่องที่ไม่เคยเข้าสแกน
+        if node == target or node not in maze_map:
             return path
 
         for d_idx, (dx, dy) in enumerate(DIRS):
             neighbor = (node[0] + dx, node[1] + dy)
             if 0 <= neighbor[0] < 4 and 0 <= neighbor[1] < 4:
-                if maze_map[node].get(d_idx) == "OPEN" and neighbor not in visited:
+                # ทางต้องไม่ติดกำแพงใน maze_map
+                wall_status = maze_map[node].get(d_idx, "OPEN")
+                if wall_status != "WALL" and neighbor not in visited:
                     visited.add(neighbor)
                     queue.append(path + [neighbor])
     return None
 
 # =============================================================================
-# 4. ฟังก์ชันหลัก
+# 4. ฟังก์ชันอ่านค่า Sensor พร้อมทำ Filter
+# =============================================================================
+def get_filtered_adc(sensor_adaptor, sensor_id, port, samples=3):
+    vals = []
+    for _ in range(samples):
+        v = sensor_adaptor.get_adc(id=sensor_id, port=port) or 0
+        if v > 0: vals.append(v)
+        time.sleep(0.01)
+    return sum(vals) // len(vals) if vals else 0
+
+# =============================================================================
+# 5. ฟังก์ชันหลัก
 # =============================================================================
 def main():
     global current_pos, current_dir_idx, step_counter
@@ -136,7 +147,7 @@ def main():
     chassis.sub_attitude(freq=20, callback=on_attitude_data)
 
     # -------------------------------------------------------------------------
-    # Calibrate เก็บค่ากึ่งกลางช่อง 3 วินาทีแรก
+    # Calibration (Port 3=Sharp ซ้าย, Port 4=Sharp ขวา)
     # -------------------------------------------------------------------------
     print("=" * 70)
     print(" 3 วินาทีแรก: วางหุ่นตรงกึ่งกลางช่อง (0,0) เพื่อจำ Reference ซ้าย-ขวา ")
@@ -147,8 +158,8 @@ def main():
     start_time = time.time()
 
     while time.time() - start_time < 3.0:
-        val_r = sensor_adaptor.get_adc(id=1, port=1) or 0
-        val_l = sensor_adaptor.get_adc(id=2, port=1) or 0
+        val_l = sensor_adaptor.get_adc(id=1, port=3) or 0
+        val_r = sensor_adaptor.get_adc(id=2, port=4) or 0
         if val_r > 0: samples_r.append(val_r)
         if val_l > 0: samples_l.append(val_l)
         
@@ -160,8 +171,8 @@ def main():
     ref_sharp_l = sum(samples_l) / len(samples_l) if samples_l else 550
     initial_yaw_offset = current_yaw
 
-    threshold_r = ref_sharp_r - 90
-    threshold_l = ref_sharp_l - 90
+    threshold_r = ref_sharp_r - 60
+    threshold_l = ref_sharp_l - 60
 
     print(f"\n\n>>> Target R={ref_sharp_r:.0f} | Target L={ref_sharp_l:.0f} | Yaw-Offset={initial_yaw_offset:.1f}° <<<")
 
@@ -171,7 +182,6 @@ def main():
         return angle
 
     def rotate_to_dir(target_dir):
-        """หมุนตัวแบบนุ่มนวลและตรงมุมเป้าหมาย"""
         global current_dir_idx
         turn_steps = (target_dir - current_dir_idx) % 4
         if turn_steps == 0:
@@ -190,7 +200,6 @@ def main():
         time.sleep(0.2)
 
     def drive_one_grid_pid():
-        """เดินหน้า 60 cm พร้อมระบบ PID Yaw Lock + Wall Centering"""
         duration = GRID_SIZE / BASE_SPEED
         t_start = time.time()
         last_yaw_error = 0.0
@@ -198,46 +207,37 @@ def main():
         target_yaw = initial_yaw_offset + YAW_TARGETS[current_dir_idx]
 
         while time.time() - t_start < duration:
-            # 1. ตรวจสอบระยะ ToF หน้า (ถึงกึ่งกลางช่อง 220 mm ตัดหยุดทันที)
-            if 0 < tof_front <= 220:
+            if 0 < tof_front <= 200:
                 break
 
-            # 2. อ่านค่าเซนเซอร์
-            sharp_r = sensor_adaptor.get_adc(id=4, port=1) or 0
             sharp_l = sensor_adaptor.get_adc(id=3, port=1) or 0
-            ir_r = sensor_adaptor.get_io(id=2, port=1)
+            sharp_r = sensor_adaptor.get_adc(id=4, port=2) or 0
             ir_l = sensor_adaptor.get_io(id=1, port=1)
+            ir_r = sensor_adaptor.get_io(id=2, port=1)
 
-            # 3. PID Yaw Controller (ล็อกทิศหัวรถให้ตรงเป๊ะ)
             yaw_error = normalize_angle(target_yaw - current_yaw)
             d_yaw = yaw_error - last_yaw_error
             z_speed = (KP_YAW * yaw_error) + (KD_YAW * d_yaw)
             last_yaw_error = yaw_error
 
-            # 4. IR Safety Shield
             if ir_r == 0:
                 y_speed = -0.12
             elif ir_l == 0:
                 y_speed = 0.12
             else:
-                # 5. Wall Centering Controller
                 has_wall_r = (sharp_r >= threshold_r)
                 has_wall_l = (sharp_l >= threshold_l)
 
                 if has_wall_r and has_wall_l:
-                    # มีกำแพง 2 ฝั่ง: คุมให้วิ่งผ่ากึ่งกลาง
                     diff = (sharp_l - ref_sharp_l) - (sharp_r - ref_sharp_r)
                     y_speed = KP_WALL * diff
                 elif has_wall_r:
-                    # มีกำแพงขวาฝั่งเดียว
                     err_r = ref_sharp_r - sharp_r
                     y_speed = KP_WALL * err_r
                 elif has_wall_l:
-                    # มีกำแพงซ้ายฝั่งเดียว
                     err_l = ref_sharp_l - sharp_l
                     y_speed = -KP_WALL * err_l
                 else:
-                    # ทางเปิดโล่ง 2 ฝั่ง: วิ่งตรงตามแนว Yaw
                     y_speed = 0.0
 
                 y_speed = max(min(y_speed, MAX_CORRECTION_Y), -MAX_CORRECTION_Y)
@@ -245,7 +245,6 @@ def main():
             chassis.drive_speed(x=BASE_SPEED, y=y_speed, z=z_speed)
             time.sleep(0.02)
 
-        # จบช่วงเดิน: เบรกนิ่งสนิท
         chassis.drive_wheels(w1=0, w2=0, w3=0, w4=0)
         time.sleep(0.25)
 
@@ -254,29 +253,29 @@ def main():
     # =========================================================================
     try:
         while True:
-            # 1. ตรวจสอบเป้าหมาย
             if current_pos == GOAL_POS:
                 rotate_to_dir(0)
                 print(f"\n🎉 บรรลุเป้าหมายพิกัด {GOAL_POS} เรียบร้อยแล้ว!")
                 print_fixed_map()
                 break
 
-            # 2. หยุดนิ่งสแกนกำแพงในช่องปัจจุบัน
             time.sleep(0.25)
-            front_wall = (0 < tof_front < 500)
-            sharp_r = sensor_adaptor.get_adc(id=1, port=1) or 0
-            sharp_l = sensor_adaptor.get_adc(id=2, port=1) or 0
+            # แก้ไขการดึงค่าด้วย Port ให้ถูกต้อง
+            sharp_l = get_filtered_adc(sensor_adaptor, 1, port=3)
+            sharp_r = get_filtered_adc(sensor_adaptor, 2, port=4)
             
+            front_wall = (0 < tof_front < 400)
             right_wall = (sharp_r >= threshold_r)
             left_wall  = (sharp_l >= threshold_l)
 
             if current_pos not in maze_map:
                 maze_map[current_pos] = {}
 
+            # แปลงทิศสัมพัทธ์ (Relative) เป็นทิศทางจริง (Absolute Grid Direction)
             f_dir = current_dir_idx
             r_dir = (current_dir_idx + 1) % 4
-            l_dir = (current_dir_idx + 3) % 4
             b_dir = (current_dir_idx + 2) % 4
+            l_dir = (current_dir_idx + 3) % 4
 
             maze_map[current_pos][f_dir] = "WALL" if front_wall else "OPEN"
             maze_map[current_pos][r_dir] = "WALL" if right_wall else "OPEN"
@@ -285,23 +284,33 @@ def main():
             if b_dir not in maze_map[current_pos]:
                 maze_map[current_pos][b_dir] = "OPEN"
 
-            # ขอบนอก 4x4
+            # ขอบสนามภายนอก 4x4
             x, y = current_pos
-            if y == 3: maze_map[current_pos][0] = "WALL"
-            if x == 3: maze_map[current_pos][1] = "WALL"
+            if y == 2: maze_map[current_pos][0] = "WALL"
+            if x == 1: maze_map[current_pos][1] = "WALL"
             if y == 0: maze_map[current_pos][2] = "WALL"
             if x == 0: maze_map[current_pos][3] = "WALL"
+
+            # บันทึกข้อมูลกำแพงสองฝั่งไปยัง Cell ข้างเคียงให้สอดคล้องกัน
+            for d_idx in range(4):
+                if maze_map[current_pos].get(d_idx) == "WALL":
+                    dx, dy = DIRS[d_idx]
+                    neighbor = (x + dx, y + dy)
+                    if 0 <= neighbor[0] < 4 and 0 <= neighbor[1] < 4:
+                        if neighbor not in maze_map:
+                            maze_map[neighbor] = {}
+                        maze_map[neighbor][(d_idx + 2) % 4] = "WALL"
 
             print(f"Debug: Front={tof_front}mm | R={sharp_r} (Th:{threshold_r:.0f}) | L={sharp_l} (Th:{threshold_l:.0f})")
             print_fixed_map()
 
-            # 3. คำนวณเส้นทาง BFS
+            # คำนวณเส้นทาง BFS
             path = bfs_path_to_goal(current_pos, GOAL_POS)
             if not path or len(path) < 2:
                 print("❌ สำรวจจนหมดแล้ว ไม่มีเส้นทางไปถึงเป้าหมายได้")
                 break
 
-            # 4. แปลงพิกัดและหมุนตัว
+            # แปลงพิกัดและหมุนตัว
             next_node = path[1]
             dx = next_node[0] - current_pos[0]
             dy = next_node[1] - current_pos[1]
@@ -309,17 +318,24 @@ def main():
 
             rotate_to_dir(target_dir)
 
-            # 5. Re-verify ด้วย ToF หน้าซ้ำ
+            # Re-verify ระยะ ToF หลังจากหมุนตัวเสร็จแล้ว
             time.sleep(0.2)
-            if 0 < tof_front <= 220:
-                print("⚠️ ToF ตรวจพบกำแพงหน้า บันทึก WALL และคำนวณใหม่...")
+            if 0 < tof_front <= 200:
+                print("⚠️ ตรวจพบกำแพงขวางหน้า อัปเดตแผนที่และหาเส้นทางใหม่...")
                 maze_map[current_pos][target_dir] = "WALL"
+                
+                # บันทึกทางฝั่งเพื่อนบ้านด้วย
+                neighbor = next_node
+                if 0 <= neighbor[0] < 4 and 0 <= neighbor[1] < 4:
+                    if neighbor not in maze_map:
+                        maze_map[neighbor] = {}
+                    maze_map[neighbor][(target_dir + 2) % 4] = "WALL"
                 continue
 
-            # 6. เดินหน้าด้วยระบบ PID
+            # เดินหน้าไป 1 ช่อง
             drive_one_grid_pid()
 
-            # เชื่อมต่อทางย้อนกลับ
+            # อัปเดตทางเชื่อมย้อนกลับ
             back_dir = (target_dir + 2) % 4
             if next_node not in maze_map:
                 maze_map[next_node] = {}
@@ -343,4 +359,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
